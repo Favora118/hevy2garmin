@@ -147,4 +147,10 @@ describe("GET /api/update-check", () => {
     expect(body.banner).toMatchObject({ behindBy: 3 });
     expect(fetchMock.mock.calls.length).toBe(calls);
   });
+
+  it("no banner while an Update now is on its way", async () => {
+    await get();
+    (state.cache as Record<string, unknown>).status = "updating";
+    expect((await get()).body.banner).toBeNull();
+  });
 });

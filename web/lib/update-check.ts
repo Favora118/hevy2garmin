@@ -60,6 +60,8 @@ export interface UpdateBanner {
   canUpdate: boolean;
 }
 
+export type SyncForkResult = { ok: true } | { ok: false; reason: "cannot-merge" | "token" | "failed" };
+
 function checkDisabled(): boolean {
   const v = (process.env.H2G_UPDATE_CHECK ?? "").trim().toLowerCase();
   return v === "off" || v === "false" || v === "0" || v === "no";
@@ -226,4 +228,40 @@ export function bannerFor(check: UpdateCheck | null, target: UpdateTarget, canUp
     ...links,
     canUpdate,
   };
+}
+
+/**
+ * After Update now worked: keep the banner from offering it again until the
+ * new deployment arrives, which changes the deployed commit and so forces a
+ * fresh check. If the deployment never arrives, the entry goes stale and the
+ * banner comes back.
+ */
+export async function markUpdating(sql: Sql): Promise<void> {
+  const cached = await readCached(sql);
+  if (cached) await writeCached(sql, { ...cached, status: "updating" });
+}
+
+/**
+ * GitHub's Sync fork: merge-upstream on the fork's default branch. A 409 or
+ * 422 means GitHub cannot merge it this way, and retrying will not change that.
+ */
+export async function syncFork(fork: string, pat: string, fetchImpl: typeof fetch = fetch): Promise<SyncForkResult> {
+  const tokenRefused = (status: number) => status === 401 || status === 403;
+  try {
+    const repo = await github(fetchImpl, pat, fork);
+    if (tokenRefused(repo.status)) return { ok: false, reason: "token" };
+    if (!repo.ok) return { ok: false, reason: "failed" };
+    const { default_branch } = (await repo.json()) as { default_branch?: string };
+    const res = await github(fetchImpl, pat, `${fork}/merge-upstream`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ branch: default_branch || "main" }),
+    });
+    if (res.ok) return { ok: true };
+    if (res.status === 409 || res.status === 422) return { ok: false, reason: "cannot-merge" };
+    if (tokenRefused(res.status)) return { ok: false, reason: "token" };
+    return { ok: false, reason: "failed" };
+  } catch {
+    return { ok: false, reason: "failed" };
+  }
 }

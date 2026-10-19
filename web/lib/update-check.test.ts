@@ -3,6 +3,8 @@ import {
   updateTarget,
   readUpdateCheck,
   bannerFor,
+  markUpdating,
+  syncFork,
   UPDATE_CACHE_KEY,
   type UpdateCheck,
   type UpdateTarget,
@@ -298,5 +300,59 @@ describe("bannerFor", () => {
     expect(bannerFor(cached({ status: "updating" }), target(), true)).toBeNull();
     expect(bannerFor(cached({ behindBy: 0 }), target(), true)).toBeNull();
     expect(bannerFor(null, target(), true)).toBeNull();
+  });
+});
+
+describe("markUpdating", () => {
+  it("marks the cached entry so the banner stops offering the update", async () => {
+    const db = fakeSql(cached());
+    await markUpdating(db.sql);
+    expect(db.state.value).toEqual(cached({ status: "updating" }));
+  });
+
+  it("writes nothing when there is no entry", async () => {
+    const db = fakeSql();
+    await markUpdating(db.sql);
+    expect(db.state.writes).toBe(0);
+  });
+});
+
+describe("syncFork", () => {
+  const fork = "someone/hevy2garmin";
+  const repo = json({ default_branch: "trunk" });
+
+  it("calls merge-upstream on the fork's default branch with the token", async () => {
+    const github = fakeGithub({
+      [`GET repos/${fork}`]: repo,
+      [`POST repos/${fork}/merge-upstream`]: json({ message: "Successfully fetched and fast-forwarded", merge_type: "fast-forward" }),
+    });
+    expect(await syncFork(fork, TOKEN, github.fetchImpl)).toEqual({ ok: true });
+    const post = github.calls.find((c) => c.method === "POST")!;
+    expect(JSON.parse(post.body!)).toEqual({ branch: "trunk" });
+    expect(post.headers.Authorization).toBe(`Bearer ${TOKEN}`);
+  });
+
+  it.each([409, 422])("%i means it cannot merge, and it does not retry", async (status) => {
+    const github = fakeGithub({ [`GET repos/${fork}`]: repo, [`POST repos/${fork}/merge-upstream`]: json({ message: "x" }, status) });
+    expect(await syncFork(fork, TOKEN, github.fetchImpl)).toEqual({ ok: false, reason: "cannot-merge" });
+    expect(github.calls.filter((c) => c.method === "POST")).toHaveLength(1);
+  });
+
+  it.each([401, 403])("%i on merge-upstream means the token cannot sync the fork", async (status) => {
+    const github = fakeGithub({ [`GET repos/${fork}`]: repo, [`POST repos/${fork}/merge-upstream`]: json({}, status) });
+    expect(await syncFork(fork, TOKEN, github.fetchImpl)).toEqual({ ok: false, reason: "token" });
+  });
+
+  it("401 reading the fork means the token, before any merge is attempted", async () => {
+    const github = fakeGithub({ [`GET repos/${fork}`]: json({}, 401) });
+    expect(await syncFork(fork, TOKEN, github.fetchImpl)).toEqual({ ok: false, reason: "token" });
+    expect(github.calls.filter((c) => c.method === "POST")).toHaveLength(0);
+  });
+
+  it("anything else, or the network failing, is a plain failure", async () => {
+    const github = fakeGithub({ [`GET repos/${fork}`]: repo, [`POST repos/${fork}/merge-upstream`]: json({}, 500) });
+    expect(await syncFork(fork, TOKEN, github.fetchImpl)).toEqual({ ok: false, reason: "failed" });
+    const down = (async () => { throw new TypeError("fetch failed"); }) as typeof fetch;
+    expect(await syncFork(fork, TOKEN, down)).toEqual({ ok: false, reason: "failed" });
   });
 });
