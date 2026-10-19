@@ -6,6 +6,7 @@ import {
   markUpdating,
   syncFork,
   UPDATE_CACHE_KEY,
+  UPDATE_FAILURE_KEY,
   type UpdateCheck,
   type UpdateTarget,
 } from "./update-check";
@@ -61,7 +62,8 @@ function fakeGithub(routes: Record<string, () => Response>) {
   }) as typeof fetch;
   return { calls, fetchImpl };
 }
-const json = (body: unknown, status = 200) => () => new Response(JSON.stringify(body), { status });
+const json = (body: unknown, status = 200, headers: Record<string, string> = {}) => () =>
+  new Response(JSON.stringify(body), { status, headers });
 const sha = (value: string) => () => new Response(value, { status: 200 });
 
 /** Upstream main is at UPSTREAM_SHA, and the compare answers `compare`. */
@@ -74,18 +76,30 @@ function upstreamWith(compare: () => Response, upstream = "drkostas/hevy2garmin"
 const compared = (status: string, aheadBy: number, mergeBaseDate = "2026-10-01T10:00:00Z") =>
   json({ status, ahead_by: aheadBy, behind_by: 0, merge_base_commit: { sha: "d".repeat(40), commit: { committer: { date: mergeBaseDate } } } });
 
-/** A fake `app_cache` holding at most the one key, recording every statement. */
-function fakeSql(initial?: unknown) {
-  const state = { value: initial as unknown, writes: 0 };
+/**
+ * A fake `app_cache` with the check's two keys: `value`/`writes` for the
+ * result, `failure`/`failureWrites` for a cached failure.
+ */
+function fakeSql(initial?: unknown, failure?: unknown) {
+  const state = { value: initial as unknown, writes: 0, failure: failure as unknown, failureWrites: 0 };
   const queries: string[] = [];
   const sql = ((strings: TemplateStringsArray, ...values: unknown[]) => {
     const text = strings.join("?");
     queries.push(text);
-    if (/^\s*SELECT/.test(text)) return Promise.resolve(state.value === undefined ? [] : [{ value: state.value }]);
+    const key = values[0];
+    expect([UPDATE_CACHE_KEY, UPDATE_FAILURE_KEY]).toContain(key);
+    if (/^\s*SELECT/.test(text)) {
+      const v = key === UPDATE_CACHE_KEY ? state.value : state.failure;
+      return Promise.resolve(v === undefined ? [] : [{ value: v }]);
+    }
     if (/^\s*INSERT INTO app_cache/.test(text)) {
-      expect(values[0]).toBe(UPDATE_CACHE_KEY);
-      state.value = values[1];
-      state.writes++;
+      if (key === UPDATE_CACHE_KEY) {
+        state.value = values[1];
+        state.writes++;
+      } else {
+        state.failure = values[1];
+        state.failureWrites++;
+      }
       return Promise.resolve([]);
     }
     throw new Error("unexpected query: " + text);
@@ -215,12 +229,107 @@ describe("readUpdateCheck: the compare", () => {
     ["upstream main not readable", () => fakeGithub({})],
     ["upstream main not a sha", () => fakeGithub({ "GET repos/drkostas/hevy2garmin/commits/main": sha("<html>") })],
     ["the network failing", () => ({ calls: [], fetchImpl: (async () => { throw new TypeError("fetch failed"); }) as typeof fetch })],
-  ])("%s means no result, and the cache is left as it was", async (_name, make) => {
+  ])("%s means no result, the cached result is left as it was, and the failure is cached", async (_name, make) => {
     const before = cached({ checkedAt: new Date(NOW - 7 * 3600_000).toISOString() });
     const { result, db } = await check(make() as ReturnType<typeof fakeGithub>, null, before);
     expect(result).toBeNull();
     expect(db.state.writes).toBe(0);
     expect(db.state.value).toEqual(before);
+    expect(db.state.failureWrites).toBe(1);
+  });
+});
+
+describe("readUpdateCheck: a cached failure", () => {
+  const HOUR = 60 * 60_000;
+  const stale = () => cached({ checkedAt: new Date(NOW - 7 * 3600_000).toISOString() });
+  const run = async (github: { calls: unknown[]; fetchImpl: typeof fetch }, initial?: unknown, failure?: unknown, now = NOW) => {
+    const db = fakeSql(initial, failure);
+    const result = await readUpdateCheck(db.sql, target(), null, { fetchImpl: github.fetchImpl, now });
+    return { result, db };
+  };
+  const down = () => ({ calls: [] as unknown[], fetchImpl: (async () => { throw new TypeError("fetch failed"); }) as typeof fetch });
+
+  it("a 5xx is cached for an hour when GitHub gives no reset time", async () => {
+    const { db } = await run(upstreamWith(json({}, 502)));
+    expect(db.state.failure).toEqual({ until: new Date(NOW + HOUR).toISOString() });
+  });
+
+  it("a network error is cached for an hour", async () => {
+    const { db } = await run(down());
+    expect(db.state.failure).toEqual({ until: new Date(NOW + HOUR).toISOString() });
+  });
+
+  it("a rate limit is cached until GitHub's x-ratelimit-reset", async () => {
+    const reset = Math.floor((NOW + 17 * 60_000) / 1000);
+    const limited = upstreamWith(
+      json({ message: "API rate limit exceeded" }, 403, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(reset) }),
+    );
+    const { db } = await run(limited);
+    expect(db.state.failure).toEqual({ until: new Date(reset * 1000).toISOString() });
+  });
+
+  it("the reset time of upstream main's read counts too, when that is the call that failed", async () => {
+    const reset = Math.floor((NOW + 5 * 60_000) / 1000);
+    const limited = fakeGithub({
+      "GET repos/drkostas/hevy2garmin/commits/main": json({ message: "API rate limit exceeded" }, 429, { "x-ratelimit-reset": String(reset) }),
+    });
+    const { db } = await run(limited);
+    expect(db.state.failure).toEqual({ until: new Date(reset * 1000).toISOString() });
+  });
+
+  it.each([
+    ["in the past", String(Math.floor((NOW - 60_000) / 1000))],
+    ["not a number", "soon"],
+  ])("a reset time %s falls back to an hour", async (_name, reset) => {
+    const { db } = await run(upstreamWith(json({}, 403, { "x-ratelimit-reset": reset })));
+    expect(db.state.failure).toEqual({ until: new Date(NOW + HOUR).toISOString() });
+  });
+
+  it("while it lasts: no result and no GitHub call, and the stale result stays as it was", async () => {
+    const github = upstreamWith(compared("ahead", 5));
+    const { result, db } = await run(github, stale(), { until: new Date(NOW + 10 * 60_000).toISOString() });
+    expect(result).toBeNull();
+    expect(github.calls).toHaveLength(0);
+    expect(db.state.value).toEqual(stale());
+    expect(db.state.writes + db.state.failureWrites).toBe(0);
+  });
+
+  it("a fresh good result is still served while a failure is cached", async () => {
+    const github = upstreamWith(compared("ahead", 5));
+    const { result } = await run(github, cached(), { until: new Date(NOW + 10 * 60_000).toISOString() });
+    expect(result).toEqual(cached());
+    expect(github.calls).toHaveLength(0);
+  });
+
+  it("once it has passed, GitHub is asked again and a good answer is cached", async () => {
+    const github = upstreamWith(compared("ahead", 5));
+    const { result, db } = await run(github, stale(), { until: new Date(NOW - 1000).toISOString() });
+    expect(github.calls.length).toBeGreaterThan(0);
+    expect(result).toMatchObject({ status: "behind", behindBy: 5 });
+    expect(db.state.value).toMatchObject({ behindBy: 5, checkedAt: new Date(NOW).toISOString() });
+  });
+
+  it("a failure never touches the cached result, fresh or stale", async () => {
+    const { db } = await run(down(), stale());
+    expect(db.state.value).toEqual(stale());
+    expect(db.state.writes).toBe(0);
+  });
+
+  it("a malformed failure entry is ignored", async () => {
+    const github = upstreamWith(compared("ahead", 5));
+    const { result } = await run(github, undefined, { until: "whenever" });
+    expect(result).toMatchObject({ behindBy: 5 });
+  });
+
+  it("a cached failure stops the second view from asking GitHub", async () => {
+    const github = down();
+    let calls = 0;
+    const counting = (async (...a: Parameters<typeof fetch>) => { calls++; return github.fetchImpl(...a); }) as typeof fetch;
+    const db = fakeSql(stale());
+    await readUpdateCheck(db.sql, target(), null, { fetchImpl: counting, now: NOW });
+    const first = calls;
+    expect(await readUpdateCheck(db.sql, target(), null, { fetchImpl: counting, now: NOW + 30 * 60_000 })).toBeNull();
+    expect(calls).toBe(first);
   });
 });
 

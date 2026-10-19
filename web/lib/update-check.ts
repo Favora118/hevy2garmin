@@ -12,9 +12,13 @@ import { getGithubRepo } from "./github";
 import type { Sql } from "./pending-store";
 
 export const UPDATE_CACHE_KEY = "update_check";
+/** A failed check, kept apart from the result so a failure never replaces it. */
+export const UPDATE_FAILURE_KEY = "update_check_failure";
 export const DEFAULT_UPSTREAM = "drkostas/hevy2garmin";
 /** How long a check is reused before GitHub is asked again. */
 export const CHECK_WINDOW_MS = 6 * 60 * 60 * 1000;
+/** How long a failed check waits when GitHub gives no rate-limit reset time. */
+export const FAILURE_WINDOW_MS = 60 * 60 * 1000;
 
 /**
  * The commit date of dc5905a, the last commit shared with the pre-rewrite
@@ -99,16 +103,23 @@ function github(fetchImpl: typeof fetch, pat: string | null, path: string, init:
 }
 
 type Compared = Omit<UpdateCheck, "checkedAt">;
+/** A failed check, with GitHub's `x-ratelimit-reset` (ms) from the failing response when it had one. */
+type Failed = { failed: true; resetAt: number | null };
 
-/** Ask GitHub how far the deployed commit is behind upstream `main`, or null on any failure. */
-async function compareWithUpstream(target: UpdateTarget, pat: string | null, fetchImpl: typeof fetch): Promise<Compared | null> {
+function failedWith(res: Response | null): Failed {
+  const seconds = Number(res?.headers.get("x-ratelimit-reset") ?? NaN);
+  return { failed: true, resetAt: Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : null };
+}
+
+/** Ask GitHub how far the deployed commit is behind upstream `main`. */
+async function compareWithUpstream(target: UpdateTarget, pat: string | null, fetchImpl: typeof fetch): Promise<Compared | Failed> {
   try {
     const head = await github(fetchImpl, pat, `${target.upstream}/commits/main`, {
       headers: { Accept: "application/vnd.github.sha" },
     });
-    if (!head.ok) return null;
+    if (!head.ok) return failedWith(head);
     const upstreamSha = (await head.text()).trim();
-    if (!SHA.test(upstreamSha)) return null;
+    if (!SHA.test(upstreamSha)) return failedWith(head);
 
     const base = { upstream: target.upstream, deployedSha: target.deployedSha, upstreamSha };
     const rewritten: Compared = { ...base, behindBy: 0, status: "rewritten" };
@@ -118,7 +129,7 @@ async function compareWithUpstream(target: UpdateTarget, pat: string | null, fet
       // Unrelated histories. Real pre-rewrite forks still share the first
       // commits and land in the date check below; this is the fallback.
       const body = (await res.json().catch(() => ({}))) as { message?: unknown };
-      return res.status === 404 && /no common ancestor/i.test(String(body.message ?? "")) ? rewritten : null;
+      return res.status === 404 && /no common ancestor/i.test(String(body.message ?? "")) ? rewritten : failedWith(res);
     }
     const d = (await res.json()) as {
       status?: string;
@@ -135,12 +146,12 @@ async function compareWithUpstream(target: UpdateTarget, pat: string | null, fet
     }
     if (d.status === "ahead" || d.status === "diverged") {
       const behindBy = Number(d.ahead_by);
-      if (!Number.isInteger(behindBy) || behindBy < 0) return null;
+      if (!Number.isInteger(behindBy) || behindBy < 0) return failedWith(res);
       return { ...base, behindBy, status: behindBy > 0 ? "behind" : "current" };
     }
-    return null;
+    return failedWith(res);
   } catch {
-    return null;
+    return failedWith(null);
   }
 }
 
@@ -158,18 +169,29 @@ function isUpdateCheck(v: unknown): v is UpdateCheck {
   );
 }
 
-async function readCached(sql: Sql): Promise<UpdateCheck | null> {
+async function readKey(sql: Sql, key: string): Promise<unknown> {
   const rows = (await sql`
-    SELECT value FROM app_cache WHERE key = ${UPDATE_CACHE_KEY} LIMIT 1
+    SELECT value FROM app_cache WHERE key = ${key} LIMIT 1
   `.catch(() => [] as Array<{ value: unknown }>)) as Array<{ value: unknown }>;
-  const v = rows[0]?.value;
+  return rows[0]?.value;
+}
+
+async function readCached(sql: Sql): Promise<UpdateCheck | null> {
+  const v = await readKey(sql, UPDATE_CACHE_KEY);
   return isUpdateCheck(v) ? v : null;
 }
 
-async function writeCached(sql: Sql, value: UpdateCheck): Promise<void> {
+/** When the cached failure stops holding back a new check, or null when none is cached. */
+async function readFailureUntil(sql: Sql): Promise<number | null> {
+  const v = (await readKey(sql, UPDATE_FAILURE_KEY)) as { until?: unknown } | undefined;
+  const until = typeof v?.until === "string" ? Date.parse(v.until) : NaN;
+  return Number.isNaN(until) ? null : until;
+}
+
+async function writeKey(sql: Sql, key: string, value: UpdateCheck | { until: string }): Promise<void> {
   await sql`
     INSERT INTO app_cache (key, value, updated_at)
-    VALUES (${UPDATE_CACHE_KEY}, ${sql.json(value)}, NOW())
+    VALUES (${key}, ${sql.json(value)}, NOW())
     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
   `.catch(() => {
     // Best effort: the answer is still right, the next view just asks again.
@@ -178,8 +200,13 @@ async function writeCached(sql: Sql, value: UpdateCheck): Promise<void> {
 
 /**
  * The cached check when it is fresh and for this deployment and upstream,
- * otherwise a new one from GitHub, cached. Null on any GitHub failure, which
- * leaves the cache as it was.
+ * otherwise a new one from GitHub, cached.
+ *
+ * Null on any GitHub failure. The failure is cached under its own key until
+ * GitHub's rate-limit reset time when the failing response gave one, else for
+ * an hour, and until then no view asks GitHub again. It never touches the
+ * cached result, so a failure can only hold back a recheck, never replace an
+ * answer.
  */
 export async function readUpdateCheck(
   sql: Sql,
@@ -196,10 +223,17 @@ export async function readUpdateCheck(
   ) {
     return cached;
   }
+  const failedUntil = await readFailureUntil(sql);
+  if (failedUntil !== null && failedUntil > now) return null;
+
   const compared = await compareWithUpstream(target, pat, fetchImpl);
-  if (!compared) return null;
+  if ("failed" in compared) {
+    const until = compared.resetAt !== null && compared.resetAt > now ? compared.resetAt : now + FAILURE_WINDOW_MS;
+    await writeKey(sql, UPDATE_FAILURE_KEY, { until: new Date(until).toISOString() });
+    return null;
+  }
   const check: UpdateCheck = { ...compared, checkedAt: new Date(now).toISOString() };
-  await writeCached(sql, check);
+  await writeKey(sql, UPDATE_CACHE_KEY, check);
   return check;
 }
 
@@ -238,7 +272,7 @@ export function bannerFor(check: UpdateCheck | null, target: UpdateTarget, canUp
  */
 export async function markUpdating(sql: Sql): Promise<void> {
   const cached = await readCached(sql);
-  if (cached) await writeCached(sql, { ...cached, status: "updating" });
+  if (cached) await writeKey(sql, UPDATE_CACHE_KEY, { ...cached, status: "updating" });
 }
 
 /**

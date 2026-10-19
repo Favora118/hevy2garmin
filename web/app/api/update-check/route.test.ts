@@ -10,16 +10,17 @@ const TOKEN = "ghp_secret_token_value";
 const DEPLOYED = "a".repeat(40);
 const UPSTREAM_SHA = "b".repeat(40);
 
-const state: { pat: string | null; cache: unknown; dbDown: boolean } = { pat: null, cache: undefined, dbDown: false };
+const state: { pat: string | null; cache: unknown; failure: unknown; dbDown: boolean } = { pat: null, cache: undefined, failure: undefined, dbDown: false };
 const queries: string[] = [];
 vi.mock("@/lib/db", () => {
   const tag = ((strings: TemplateStringsArray, ...values: unknown[]) => {
     const q = strings.join("?");
     queries.push(q);
     if (q.includes("FROM platform_credentials")) return Promise.resolve(state.pat ? [{ credentials: { pat: state.pat } }] : []);
-    if (/^\s*SELECT value FROM app_cache/.test(q)) return Promise.resolve(state.cache === undefined ? [] : [{ value: state.cache }]);
+    const slot = values[0] === "update_check_failure" ? "failure" : "cache";
+    if (/^\s*SELECT value FROM app_cache/.test(q)) return Promise.resolve(state[slot] === undefined ? [] : [{ value: state[slot] }]);
     if (/^\s*INSERT INTO app_cache/.test(q)) {
-      state.cache = values[1];
+      state[slot] = values[1];
       return Promise.resolve([]);
     }
     return Promise.reject(new Error("unexpected query: " + q));
@@ -69,6 +70,7 @@ beforeEach(() => {
   process.env.VERCEL_GIT_REPO_SLUG = "hevy2garmin";
   state.pat = null;
   state.cache = undefined;
+  state.failure = undefined;
   state.dbDown = false;
   queries.length = 0;
   fetchMock.mockReset();
@@ -130,6 +132,29 @@ describe("GET /api/update-check", () => {
     const { status, body } = await get();
     expect(status).toBe(200);
     expect(body.banner).toBeNull();
+  });
+
+  it("GitHub failing: the next view asks GitHub nothing, and still shows no banner", async () => {
+    fetchMock.mockRejectedValue(new TypeError("fetch failed"));
+    await get();
+    const calls = fetchMock.mock.calls.length;
+    expect(calls).toBeGreaterThan(0);
+    const { status, body } = await get();
+    expect(status).toBe(200);
+    expect(body.banner).toBeNull();
+    expect(fetchMock.mock.calls.length).toBe(calls);
+  });
+
+  it("GitHub failing after a good check: the good result is kept as it was", async () => {
+    await get();
+    const good = state.cache as Record<string, unknown>;
+    good.checkedAt = new Date(Date.now() - 7 * 3600_000).toISOString();
+    const before = { ...good };
+    fetchMock.mockReset();
+    fetchMock.mockResolvedValue(new Response("{}", { status: 503 }));
+    expect((await get()).body.banner).toBeNull();
+    expect(state.cache).toEqual(before);
+    expect(state.failure).toMatchObject({ until: expect.any(String) });
   });
 
   it("the database failing: no banner, not an error", async () => {
