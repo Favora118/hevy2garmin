@@ -72,6 +72,8 @@ describe("UpdateBannerView", () => {
   it("already in sync: says so, with no polling message and no button", () => {
     const html = render(behind(), "up-to-date");
     expect(html).toContain("Your fork is already up to date (a new deployment may still be on its way).");
+    expect(html).not.toContain("Update available");
+    expect(html).not.toMatch(/\d+ new change/);
     expect(html).not.toContain("Updating…");
     expect(html).not.toContain("Update now");
   });

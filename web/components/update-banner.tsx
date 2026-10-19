@@ -93,7 +93,8 @@ export function UpdateBannerView({
   return (
     <div className="mb-6 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-teal/40 bg-teal/10 p-4">
       <p className="min-w-0 flex-1 basis-full text-sm text-text sm:basis-60">
-        {banner.kind === "behind" ? (
+        {/* Already in sync, "Update available" would contradict the line below it. */}
+        {phase === "up-to-date" ? null : banner.kind === "behind" ? (
           <>Update available: {n} new {n === 1 ? "change" : "changes"} since your version.</>
         ) : (
           <>
@@ -108,7 +109,7 @@ export function UpdateBannerView({
           </span>
         )}
         {phase === "up-to-date" && (
-          <span className="mt-1 block text-text-secondary" role="status">
+          <span className="block text-text-secondary" role="status">
             Your fork is already up to date (a new deployment may still be on its way).
           </span>
         )}
