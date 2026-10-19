@@ -74,6 +74,8 @@ describe("UpdateBannerView", () => {
     expect(html).toContain("Your fork is already up to date (a new deployment may still be on its way).");
     expect(html).not.toContain("Update available");
     expect(html).not.toMatch(/\d+ new change/);
+    expect(html).not.toContain("See what&#x27;s new");
+    expect(html).toContain("Dismiss");
     expect(html).not.toContain("Updating…");
     expect(html).not.toContain("Update now");
   });

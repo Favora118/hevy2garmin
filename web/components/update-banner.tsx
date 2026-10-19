@@ -93,7 +93,7 @@ export function UpdateBannerView({
   return (
     <div className="mb-6 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-teal/40 bg-teal/10 p-4">
       <p className="min-w-0 flex-1 basis-full text-sm text-text sm:basis-60">
-        {/* Already in sync, "Update available" would contradict the line below it. */}
+        {/* Already in sync, "Update available" and See what's new would contradict the line below. */}
         {phase === "up-to-date" ? null : banner.kind === "behind" ? (
           <>Update available: {n} new {n === 1 ? "change" : "changes"} since your version.</>
         ) : (
@@ -138,7 +138,7 @@ export function UpdateBannerView({
             {phase === "requesting" ? "Updating…" : "Update now"}
           </button>
         )}
-        {banner.kind === "behind" && banner.compareUrl && (
+        {banner.kind === "behind" && banner.compareUrl && phase !== "up-to-date" && (
           <a href={banner.compareUrl} className={`text-xs ${link}`}>
             See what&apos;s new
           </a>
