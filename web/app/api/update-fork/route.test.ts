@@ -44,13 +44,29 @@ import { POST } from "./route";
 const ENV = ["H2G_UPDATE_CHECK", "H2G_UPSTREAM_REPO", "DEMO_MODE", "VERCEL", "VERCEL_GIT_COMMIT_SHA", "HEVY2GARMIN_COMMIT_SHA", "GITHUB_REPO", "GITHUB_PAT", "VERCEL_GIT_REPO_OWNER", "VERCEL_GIT_REPO_SLUG"];
 const saved: Record<string, string | undefined> = {};
 
-/** The fork's default branch is main; merge-upstream answers `status`. */
-function mergeAnswers(status: number) {
+const UPSTREAM_SHA = "b".repeat(40);
+/** GitHub's real merge-upstream answer for a fork that is already in sync. */
+const IN_SYNC = { message: "This branch is not behind the upstream drkostas:main.", merge_type: "none", base_branch: "drkostas:main" };
+
+/**
+ * The fork's default branch is main; merge-upstream answers `status` with
+ * `body`. Upstream main is UPSTREAM_SHA, and the compare with the deployed
+ * commit says `compare` (ahead_by 2 when "ahead").
+ */
+function mergeAnswers(
+  status: number,
+  body: unknown = { message: "x", merge_type: "fast-forward", base_branch: "drkostas:main" },
+  compare = "ahead",
+) {
   fetchMock.mockImplementation(async (url: string, init: RequestInit = {}) => {
     if (url === "https://api.github.com/repos/someone/hevy2garmin" && (init.method ?? "GET") === "GET") {
       return new Response(JSON.stringify({ default_branch: "main" }));
     }
-    if (url.endsWith("/merge-upstream")) return new Response(JSON.stringify({ message: "x" }), { status });
+    if (url.endsWith("/merge-upstream")) return new Response(JSON.stringify(body), { status });
+    if (url.endsWith("/commits/main")) return new Response(UPSTREAM_SHA);
+    if (url.includes("/compare/")) {
+      return new Response(JSON.stringify({ status: compare, ahead_by: compare === "ahead" ? 2 : 0, merge_base_commit: { commit: { committer: { date: "2026-10-01T00:00:00Z" } } } }));
+    }
     return new Response("{}", { status: 404 });
   });
 }
@@ -98,13 +114,37 @@ describe("POST /api/update-fork", () => {
   it("syncs the fork and marks the cache so the banner stops offering it", async () => {
     const { status, body, text } = await post();
     expect(status).toBe(200);
-    expect(body).toEqual({ ok: true });
+    expect(body).toEqual({ ok: true, upToDate: false });
     const merge = fetchMock.mock.calls.find(([url]) => String(url).endsWith("/merge-upstream"))!;
     expect(merge[0]).toBe("https://api.github.com/repos/someone/hevy2garmin/merge-upstream");
     expect(JSON.parse(merge[1].body)).toEqual({ branch: "main" });
     expect(merge[1].headers.Authorization).toBe(`Bearer ${TOKEN}`);
     expect(state.cache).toMatchObject({ status: "updating" });
     expect(text).not.toContain(TOKEN);
+  });
+
+  it.each(["fast-forward", "merge"])("merge_type %s: started, the cache marked updating", async (mergeType) => {
+    mergeAnswers(200, { message: "x", merge_type: mergeType, base_branch: "drkostas:main" });
+    const { status, body } = await post();
+    expect(status).toBe(200);
+    expect(body).toEqual({ ok: true, upToDate: false });
+    expect(state.cache).toMatchObject({ status: "updating" });
+  });
+
+  it("merge_type none, deployment current: already up to date, and the check is refreshed to up to date", async () => {
+    mergeAnswers(200, IN_SYNC, "identical");
+    const { status, body, text } = await post();
+    expect(status).toBe(200);
+    expect(body).toEqual({ ok: true, upToDate: true });
+    expect(state.cache).toMatchObject({ status: "current", behindBy: 0, upstreamSha: UPSTREAM_SHA });
+    expect(text).not.toContain(TOKEN);
+  });
+
+  it("merge_type none, deployment still behind: already up to date, cached as updating so the banner goes", async () => {
+    mergeAnswers(200, IN_SYNC, "ahead");
+    const { body } = await post();
+    expect(body).toEqual({ ok: true, upToDate: true });
+    expect(state.cache).toMatchObject({ status: "updating", behindBy: 2 });
   });
 
   it.each([409, 422])("%i: the fork and the docs links, once, no retry", async (code) => {

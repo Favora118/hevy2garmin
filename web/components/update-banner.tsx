@@ -40,8 +40,8 @@ function writeDismissed(sha: string) {
   }
 }
 
-/** Where Update now is: not asked, asked, taken by GitHub, or why it was not. */
-export type UpdatePhase = "idle" | "requesting" | "started" | "cannot-merge" | "token" | "failed";
+/** Where Update now is: not asked, asked, taken by GitHub, already in sync, or why it was not. */
+export type UpdatePhase = "idle" | "requesting" | "started" | "up-to-date" | "cannot-merge" | "token" | "failed";
 
 /**
  * Wait until the deployed commit differs from the first one read, reading
@@ -107,6 +107,11 @@ export function UpdateBannerView({
             Updating… your dashboard will reload with the new version in about a minute.
           </span>
         )}
+        {phase === "up-to-date" && (
+          <span className="mt-1 block text-text-secondary" role="status">
+            Your fork is already up to date (a new deployment may still be on its way).
+          </span>
+        )}
         {phase === "cannot-merge" && (
           <span className="mt-1 block text-warm" role="alert">
             GitHub can&apos;t update your fork automatically. <a href={banner.forkUrl} className={link}>Open your fork</a>{" "}
@@ -169,7 +174,12 @@ export function UpdateBanner() {
     setPhase("requesting");
     try {
       const res = await fetch(withBasePath("/api/update-fork"), { method: "POST" });
-      const d = (await res.json().catch(() => ({}))) as { ok?: boolean; reason?: string };
+      const d = (await res.json().catch(() => ({}))) as { ok?: boolean; upToDate?: boolean; reason?: string };
+      if (res.ok && d.ok && d.upToDate) {
+        // Nothing was merged, so there is no deployment of ours to wait for.
+        setPhase("up-to-date");
+        return;
+      }
       if (res.ok && d.ok) {
         setPhase("started");
         const arrived = await waitForNewVersion(readDeployedCommit, {

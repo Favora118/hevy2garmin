@@ -4,6 +4,7 @@ import {
   readUpdateCheck,
   bannerFor,
   markUpdating,
+  recheckAfterInSync,
   syncFork,
   UPDATE_CACHE_KEY,
   UPDATE_FAILURE_KEY,
@@ -435,10 +436,38 @@ describe("syncFork", () => {
       [`GET repos/${fork}`]: repo,
       [`POST repos/${fork}/merge-upstream`]: json({ message: "Successfully fetched and fast-forwarded", merge_type: "fast-forward" }),
     });
-    expect(await syncFork(fork, TOKEN, github.fetchImpl)).toEqual({ ok: true });
+    expect(await syncFork(fork, TOKEN, github.fetchImpl)).toEqual({ ok: true, upToDate: false });
     const post = github.calls.find((c) => c.method === "POST")!;
     expect(JSON.parse(post.body!)).toEqual({ branch: "trunk" });
     expect(post.headers.Authorization).toBe(`Bearer ${TOKEN}`);
+  });
+
+  it("merge_type none (GitHub's real answer for a fork in sync) means already up to date", async () => {
+    const github = fakeGithub({
+      [`GET repos/${fork}`]: repo,
+      [`POST repos/${fork}/merge-upstream`]: json({
+        message: "This branch is not behind the upstream drkostas:main.",
+        merge_type: "none",
+        base_branch: "drkostas:main",
+      }),
+    });
+    expect(await syncFork(fork, TOKEN, github.fetchImpl)).toEqual({ ok: true, upToDate: true });
+  });
+
+  it.each(["fast-forward", "merge"])("merge_type %s means the update started", async (mergeType) => {
+    const github = fakeGithub({
+      [`GET repos/${fork}`]: repo,
+      [`POST repos/${fork}/merge-upstream`]: json({ message: "x", merge_type: mergeType, base_branch: "drkostas:main" }),
+    });
+    expect(await syncFork(fork, TOKEN, github.fetchImpl)).toEqual({ ok: true, upToDate: false });
+  });
+
+  it("a 200 without a readable body still means the update started", async () => {
+    const github = fakeGithub({
+      [`GET repos/${fork}`]: repo,
+      [`POST repos/${fork}/merge-upstream`]: () => new Response("not json", { status: 200 }),
+    });
+    expect(await syncFork(fork, TOKEN, github.fetchImpl)).toEqual({ ok: true, upToDate: false });
   });
 
   it.each([409, 422])("%i means it cannot merge, and it does not retry", async (status) => {
@@ -463,5 +492,37 @@ describe("syncFork", () => {
     expect(await syncFork(fork, TOKEN, github.fetchImpl)).toEqual({ ok: false, reason: "failed" });
     const down = (async () => { throw new TypeError("fetch failed"); }) as typeof fetch;
     expect(await syncFork(fork, TOKEN, down)).toEqual({ ok: false, reason: "failed" });
+  });
+});
+
+describe("recheckAfterInSync", () => {
+  // merge-upstream said the fork is already in sync. The check compares the
+  // deployed commit, which that does not move, so a deployment may still be on
+  // its way: the banner must go either way.
+  const run = async (github: { calls: unknown[]; fetchImpl: typeof fetch }, initial: unknown = cached()) => {
+    const db = fakeSql(initial);
+    await recheckAfterInSync(db.sql, target(), TOKEN, { fetchImpl: github.fetchImpl, now: NOW });
+    return db;
+  };
+
+  it("asks GitHub even when the cached check is fresh, and caches up to date", async () => {
+    const github = upstreamWith(compared("identical", 0));
+    const db = await run(github);
+    expect(github.calls.length).toBeGreaterThan(0);
+    expect(db.state.value).toMatchObject({ status: "current", behindBy: 0, checkedAt: new Date(NOW).toISOString() });
+    expect(bannerFor(db.state.value as UpdateCheck, target(), true)).toBeNull();
+  });
+
+  it("still behind means the deployment is on its way: cached as updating, so no banner", async () => {
+    const db = await run(upstreamWith(compared("ahead", 4)));
+    expect(db.state.value).toMatchObject({ status: "updating", behindBy: 4, checkedAt: new Date(NOW).toISOString() });
+    expect(bannerFor(db.state.value as UpdateCheck, target(), true)).toBeNull();
+  });
+
+  it("GitHub failing: the cached entry is marked updating, and no failure replaces it", async () => {
+    const down = { calls: [] as unknown[], fetchImpl: (async () => { throw new TypeError("fetch failed"); }) as typeof fetch };
+    const db = await run(down);
+    expect(db.state.value).toEqual(cached({ status: "updating" }));
+    expect(db.state.failureWrites).toBe(0);
   });
 });

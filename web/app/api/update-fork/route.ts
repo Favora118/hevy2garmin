@@ -4,7 +4,7 @@ import { getDb } from "@/lib/db";
 import { demoMode } from "@/lib/demo";
 import { authEnabled, verifySession, SESSION_COOKIE } from "@/lib/auth";
 import { getGithubPat } from "@/lib/github";
-import { docsUrl, forkUrl, markUpdating, syncFork, updateTarget } from "@/lib/update-check";
+import { docsUrl, forkUrl, markUpdating, recheckAfterInSync, syncFork, updateTarget } from "@/lib/update-check";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -16,6 +16,10 @@ export const runtime = "nodejs";
  * through merge-upstream on the fork's default branch with the saved token.
  * Vercel redeploys when the fork's branch moves. Only on a Vercel fork with a
  * saved token; self-hosted there is nothing to redeploy from the fork.
+ *
+ * When GitHub had nothing to merge (merge_type "none") the answer says the
+ * fork is already up to date, and the cached check is refreshed so the banner
+ * goes; otherwise the cached check is marked as updating.
  *
  * A 409 or 422 from GitHub is not retried: the answer carries the fork and the
  * README's update steps instead. A 401 or 403 means the token cannot sync the
@@ -58,8 +62,8 @@ export async function POST() {
 
   const result = await syncFork(target.fork, pat);
   if (result.ok) {
-    if (sql) await markUpdating(sql);
-    return NextResponse.json({ ok: true });
+    if (sql) await (result.upToDate ? recheckAfterInSync(sql, target, pat) : markUpdating(sql));
+    return NextResponse.json({ ok: true, upToDate: result.upToDate });
   }
   if (result.reason === "cannot-merge") {
     return NextResponse.json(

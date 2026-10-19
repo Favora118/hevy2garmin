@@ -69,6 +69,13 @@ describe("UpdateBannerView", () => {
     expect(html).not.toContain("Update now");
   });
 
+  it("already in sync: says so, with no polling message and no button", () => {
+    const html = render(behind(), "up-to-date");
+    expect(html).toContain("Your fork is already up to date (a new deployment may still be on its way).");
+    expect(html).not.toContain("Updating…");
+    expect(html).not.toContain("Update now");
+  });
+
   it("409/422: the fork and the docs, no retry", () => {
     const html = render(behind(), "cannot-merge");
     expect(html).toContain("GitHub can&#x27;t update your fork automatically");

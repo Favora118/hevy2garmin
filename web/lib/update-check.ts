@@ -64,7 +64,11 @@ export interface UpdateBanner {
   canUpdate: boolean;
 }
 
-export type SyncForkResult = { ok: true } | { ok: false; reason: "cannot-merge" | "token" | "failed" };
+/**
+ * `upToDate`: GitHub had nothing to merge (merge_type "none"), so no new
+ * deployment was started by this call.
+ */
+export type SyncForkResult = { ok: true; upToDate: boolean } | { ok: false; reason: "cannot-merge" | "token" | "failed" };
 
 function checkDisabled(): boolean {
   const v = (process.env.H2G_UPDATE_CHECK ?? "").trim().toLowerCase();
@@ -276,6 +280,29 @@ export async function markUpdating(sql: Sql): Promise<void> {
 }
 
 /**
+ * After merge-upstream found the fork already in sync: ask GitHub again now,
+ * past a fresh cached check, so the banner stops offering the update. The
+ * check compares the deployed commit, which the fork being in sync does not
+ * move, so a deployment may still be on its way: still behind is cached as
+ * `updating` rather than shown. When GitHub fails, the cached entry is marked
+ * `updating` instead, and no failure is cached over it.
+ */
+export async function recheckAfterInSync(
+  sql: Sql,
+  target: UpdateTarget,
+  pat: string | null,
+  { fetchImpl = fetch, now = Date.now() }: { fetchImpl?: typeof fetch; now?: number } = {},
+): Promise<void> {
+  const compared = await compareWithUpstream(target, pat, fetchImpl);
+  if ("failed" in compared) return markUpdating(sql);
+  await writeKey(sql, UPDATE_CACHE_KEY, {
+    ...compared,
+    status: compared.status === "behind" ? "updating" : compared.status,
+    checkedAt: new Date(now).toISOString(),
+  });
+}
+
+/**
  * GitHub's Sync fork: merge-upstream on the fork's default branch. A 409 or
  * 422 means GitHub cannot merge it this way, and retrying will not change that.
  */
@@ -291,7 +318,11 @@ export async function syncFork(fork: string, pat: string, fetchImpl: typeof fetc
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ branch: default_branch || "main" }),
     });
-    if (res.ok) return { ok: true };
+    if (res.ok) {
+      // "fast-forward" and "merge" moved the branch; "none" means it was not behind.
+      const { merge_type } = (await res.json().catch(() => ({}))) as { merge_type?: unknown };
+      return { ok: true, upToDate: merge_type === "none" };
+    }
     if (res.status === 409 || res.status === 422) return { ok: false, reason: "cannot-merge" };
     if (tokenRefused(res.status)) return { ok: false, reason: "token" };
     return { ok: false, reason: "failed" };
