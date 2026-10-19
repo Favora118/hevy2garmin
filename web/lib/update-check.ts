@@ -107,12 +107,31 @@ function github(fetchImpl: typeof fetch, pat: string | null, path: string, init:
 }
 
 type Compared = Omit<UpdateCheck, "checkedAt">;
-/** A failed check, with GitHub's `x-ratelimit-reset` (ms) from the failing response when it had one. */
-type Failed = { failed: true; resetAt: number | null };
+/**
+ * A failed check, with what the failing response said about when to come
+ * back: `retry-after` (seconds, in ms here) and `x-ratelimit-reset` (an epoch
+ * time, in ms here), each null when absent or not a positive number.
+ */
+type Failed = { failed: true; retryAfterMs: number | null; resetAt: number | null };
+
+function positiveSeconds(value: string | null | undefined): number | null {
+  const seconds = Number(value ?? NaN);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : null;
+}
 
 function failedWith(res: Response | null): Failed {
-  const seconds = Number(res?.headers.get("x-ratelimit-reset") ?? NaN);
-  return { failed: true, resetAt: Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : null };
+  return {
+    failed: true,
+    retryAfterMs: positiveSeconds(res?.headers.get("retry-after")),
+    resetAt: positiveSeconds(res?.headers.get("x-ratelimit-reset")),
+  };
+}
+
+/** When a failed check may be tried again: retry-after, else a future reset time, else an hour. */
+function failureUntil(failed: Failed, now: number): number {
+  if (failed.retryAfterMs !== null) return now + failed.retryAfterMs;
+  if (failed.resetAt !== null && failed.resetAt > now) return failed.resetAt;
+  return now + FAILURE_WINDOW_MS;
 }
 
 /** Ask GitHub how far the deployed commit is behind upstream `main`. */
@@ -206,9 +225,9 @@ async function writeKey(sql: Sql, key: string, value: UpdateCheck | { until: str
  * The cached check when it is fresh and for this deployment and upstream,
  * otherwise a new one from GitHub, cached.
  *
- * Null on any GitHub failure. The failure is cached under its own key until
- * GitHub's rate-limit reset time when the failing response gave one, else for
- * an hour, and until then no view asks GitHub again. It never touches the
+ * Null on any GitHub failure. The failure is cached under its own key for
+ * the failing response's `retry-after` when it gave one, else until its
+ * rate-limit reset time when that is in the future, else for an hour, and until then no view asks GitHub again. It never touches the
  * cached result, so a failure can only hold back a recheck, never replace an
  * answer.
  */
@@ -232,8 +251,7 @@ export async function readUpdateCheck(
 
   const compared = await compareWithUpstream(target, pat, fetchImpl);
   if ("failed" in compared) {
-    const until = compared.resetAt !== null && compared.resetAt > now ? compared.resetAt : now + FAILURE_WINDOW_MS;
-    await writeKey(sql, UPDATE_FAILURE_KEY, { until: new Date(until).toISOString() });
+    await writeKey(sql, UPDATE_FAILURE_KEY, { until: new Date(failureUntil(compared, now)).toISOString() });
     return null;
   }
   const check: UpdateCheck = { ...compared, checkedAt: new Date(now).toISOString() };

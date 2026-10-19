@@ -278,6 +278,36 @@ describe("readUpdateCheck: a cached failure", () => {
     expect(db.state.failure).toEqual({ until: new Date(reset * 1000).toISOString() });
   });
 
+  it("a retry-after (seconds) is honoured first, over a reset time in the same response", async () => {
+    const reset = Math.floor((NOW + 40 * 60_000) / 1000);
+    const limited = upstreamWith(
+      json({ message: "You have exceeded a secondary rate limit" }, 403, { "retry-after": "90", "x-ratelimit-reset": String(reset) }),
+    );
+    const { db } = await run(limited);
+    expect(db.state.failure).toEqual({ until: new Date(NOW + 90_000).toISOString() });
+  });
+
+  it("a retry-after on upstream main's read counts too", async () => {
+    const limited = fakeGithub({ "GET repos/drkostas/hevy2garmin/commits/main": json({}, 429, { "retry-after": "30" }) });
+    const { db } = await run(limited);
+    expect(db.state.failure).toEqual({ until: new Date(NOW + 30_000).toISOString() });
+  });
+
+  it.each([
+    ["not a number", "later"],
+    ["zero", "0"],
+    ["negative", "-5"],
+  ])("a retry-after that is %s falls back to the reset time", async (_name, retryAfter) => {
+    const reset = Math.floor((NOW + 12 * 60_000) / 1000);
+    const { db } = await run(upstreamWith(json({}, 403, { "retry-after": retryAfter, "x-ratelimit-reset": String(reset) })));
+    expect(db.state.failure).toEqual({ until: new Date(reset * 1000).toISOString() });
+  });
+
+  it("a bad retry-after and no reset time fall back to an hour", async () => {
+    const { db } = await run(upstreamWith(json({}, 503, { "retry-after": "later" })));
+    expect(db.state.failure).toEqual({ until: new Date(NOW + HOUR).toISOString() });
+  });
+
   it.each([
     ["in the past", String(Math.floor((NOW - 60_000) / 1000))],
     ["not a number", "soon"],
